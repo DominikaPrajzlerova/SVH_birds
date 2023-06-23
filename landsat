@@ -1,0 +1,353 @@
+library(rgee)
+
+# working directory
+wd <- "" 
+setwd(wd)
+
+path.igaD <- ""
+
+
+source(paste0(getwd(), "/R/export_raster/functions.R"))
+
+
+required_packages <-
+  c("sp", "rgdal", "mapview", "raster", "geojsonio", "stars", "httpuv", "tidyverse", "sf", "lubridate", "magrittr", "dplyr", "readxl", "abind", "stringr")
+
+install.packages(setdiff(required_packages, rownames(installed.packages())))
+
+
+lapply(required_packages, require, character.only = TRUE)
+
+
+use_google_drive <- TRUE
+
+ee_Initialize(email = "", drive = use_google_drive)
+
+
+
+#projection
+res_proj_epsg <- 4326
+
+## pixel size in meters
+scale <- 30
+
+
+tag_name <- scale # "" # gsub('[^0-9-]', '-', Sys.time())
+
+
+export_path <- paste0(path.igaD, "predsDP/")
+export_fileName <- "0rad-czechia_wc_l8_2014-2017_4-8_median"
+
+
+
+git_project_path <- getwd()
+
+
+SitMap.selected <- unname(unlist(read_csv(paste0(wd, "/R/clean/SitMap_0Rad-selected.csv"))))
+SitMap <- st_transform(st_read(paste0(path.igaD, "sitmap_0rad/sitmap_0rad.shp")), crs = 4326) %>% dplyr::select(POLE)
+SitMap.POLE.selected <- SitMap %>% dplyr::filter(POLE %in% SitMap.selected)
+
+
+# bounding box
+
+cesko <- list(
+  xmin = 12.0,
+  xmax = 19.0,
+  ymin = 48.5,
+  ymax = 51.2
+)
+
+
+
+# select bounding box
+bb <- cesko
+# bb <- paste0(git_project_path, "/shp/ne_50m_admin_0_countries/czechia/cz_4326.shp")
+
+
+
+# time range
+years_range <- list(from = "2014-01-01", to = "2017-12-31")
+
+# season range
+season_months_range <- list(c(4, 4), c(5, 5), c(6, 6), c(7, 7), c(8, 8))
+
+## export rasters
+# if specified, the rasters will be saved as physical files on the disk
+# if not, RasterLayer to RasterStack (variable: raster_stack)
+output_raster_ext <- "" # asc, tif, grd, envi, img
+
+## display a map window with a polygon area and an RGB composite
+vis_map <- FALSE
+
+## NoDataValue
+no_data_value <- -9999 
+
+
+threshold_px_count <- 0
+
+########################################################################
+raster_stack_list <- list()
+file_name_list <- list()
+
+# directory for export
+dir.create(export_path, showWarnings = FALSE)
+
+
+gee_datasets_path_csv <-
+  paste0(git_project_path, "/gee_datasets/gee-pouzite-datasety.csv")
+
+
+source(paste0(git_project_path, "/R/export_raster/functions.R"))
+
+
+gdl <- gee_datasets_list(gee_datasets_path_csv)
+
+
+xmin <- bb$xmin
+xmax <- bb$xmax
+ymin <- bb$ymin
+ymax <- bb$ymax
+
+bb_geometry <- NULL
+bb_geometry_rectangle <- ee$Geometry$Rectangle(
+  coords = c(xmin, ymin, xmax, ymax),
+  proj = "EPSG:4326",
+  geodesic = FALSE
+)
+
+POLE <- SitMap.POLE.selected %>% sf_as_ee()
+envelope <- st_as_sfc(st_bbox(SitMap.POLE.selected)) %>% sf_as_ee()
+
+output_df <- list()
+
+start_time <- Sys.time()
+
+for (season in season_months_range) {
+  print("season:")
+  print(season[1])
+  
+#####   L8 _SR 'LANDSAT/LC08/C01/T1_SR' - raw bands    ######
+
+  
+# filtering
+  l8_sr_collection <-
+    ee$ImageCollection(gdl$landsat2$geeSnippet)$
+    # filterBounds(bb_geometry_rectangle)$ # nevhodné dělat předem?
+    filterDate(years_range$from, years_range$to)$
+    filter(
+      ee$Filter$calendarRange(season[1], season[2], "month")
+    )$map(mask_L8_sr2_qa)$map(mask_L8_sr2_radsat)$map(mask_L8_sr2_aerosol)$map(applyScaleFactors)
+  
+  
+  
+  
+  
+  bands_all <- c("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+  bn <- l8_sr_collection$first()$bandNames()$getInfo()
+  bn.renamed <- gsub("SR_|ST_", "", bn)
+  
+  l8_sr_collection <- l8_sr_collection$select(bn, bn.renamed)
+  
+
+  # raw
+
+  output_df[[paste0("l8_", scale, "_", season[1], "_raw_stdev")]] <- ee_extract(
+    x = l8_sr_collection$select(bands_all)$median(),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_raw_median")]] <- ee_extract(
+    x = l8_sr_collection$select(bands_all)$median(),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+  
+
+  # ndvi
+
+  output_df[[paste0("l8_", scale, "_", season[1], "_ndvi_stdev")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B5", "B4"))$median()$normalizedDifference(c("B5", "B4")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_ndvi_median")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B5", "B4"))$median()$normalizedDifference(c("B5", "B4")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+  
+  
+
+  # mndwi
+
+  output_df[[paste0("l8_", scale, "_", season[1], "_mndwi_stdev")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B3", "B6"))$median()$normalizedDifference(c("B3", "B6")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_mndwi_median")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B3", "B6"))$median()$normalizedDifference(c("B3", "B6")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+  
+  
+
+  # ndwi 
+
+  output_df[[paste0("l8_", scale, "_", season[1], "_ndwi_stdev")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B5", "B6"))$median()$normalizedDifference(c("B5", "B6")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_ndwi_median")]] <- ee_extract(
+    x = l8_sr_collection$select(c("B5", "B6"))$median()$normalizedDifference(c("B5", "B6")),
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+  
+
+  # evi
+
+  evi_prep <- l8_sr_collection$select(c("B5", "B4", "B2"))$median()
+  
+  evi_res <- evi_prep$expression(
+    "2.5 * ((B5 - B4) / (B5 + 6 * B4 - 7.5 * B2 + 1))",
+    list(
+      B5 = evi_prep$select("B5"),
+      B4 = evi_prep$select("B4"),
+      B2 = evi_prep$select("B2")
+    )
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_evi_stdev")]] <- ee_extract(
+    x = evi_res,
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_evi_median")]] <- ee_extract(
+    x = evi_res,
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+  
+
+  # msavi
+
+  msavi_prep <- l8_sr_collection$select(c("B5", "B4"))$median()
+  msavi_res <- msavi_prep$expression(
+    "(2 * B5 + 1 - sqrt(pow((2 * B5 + 1), 2) - 8 * (B5 - B4))) / 2",
+    list(
+      B5 = msavi_prep$select("B5"),
+      B4 = msavi_prep$select("B4")
+    )
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_msavi_stdev")]] <- ee_extract(
+    x = msavi_res,
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$stdDev(),
+    sf = FALSE
+  )
+  
+  output_df[[paste0("l8_", scale, "_", season[1], "_msavi_median")]] <- ee_extract(
+    x = msavi_res,
+    y = SitMap.POLE.selected,
+    scale = scale,
+    fun = ee$Reducer$median(),
+    sf = FALSE
+  )
+}
+
+
+
+
+saveRDS(output_df, file = paste0(export_path, export_fileName, ".rds"))
+
+
+end_time <- Sys.time()
+
+# časové rozmezí a celkový čas generování
+print(paste("start:", start_time))
+print(paste("konec:", end_time))
+print(end_time - start_time)
+
+
+# # sloučit N a S
+# for (l1 in names(kfme16.N)) {
+#     kfme16.N[[l1]] %<>% add_row(kfme16.S[[l1]])
+# }
+
+# kfme16 <- output_df <- readRDS("/home/petr/Documents/igaD/predictorsDP/kfme1rad-all_czechia_wc_l8_2014-2017_4-8.rds")
+kfme16 <- output_df #  <- readRDS("/home/petr/Documents/igaD/predictorsDP/kfme0rad-all_czechia_wc_l8_2014-2017_4-8.rds")
+
+
+create.tibble <- TRUE
+kfme1rad <- list()
+for (l1 in names(kfme16)) {
+  kfme16.t <- as_tibble(kfme16[[l1]])
+  
+  print(l1)
+  names(kfme16[[l1]])[-1]
+  
+  names(kfme16.t) <- c("POLE", paste0(str_replace(l1, "_30", ""), "_", names(kfme16.t[-1])))
+  
+  if (create.tibble) {
+    tbl <- bind_rows(kfme16.t)
+    create.tibble <- FALSE
+  } else {
+    
+    # tbl %<>% add_row(bind_rows(all.values))
+    tbl %<>% bind_cols(kfme16.t %>% dplyr::select(-POLE))
+  }
+  
+  # dodělávka CV
+  if (grepl("stdev", l1, fixed = TRUE)) {
+    l1.mean <- gsub("stdev", "median", l1)
+    print(l1.mean)
+    
+    kfme16.t.mean <- as_tibble(kfme16[[l1.mean]])
+    
+    names(kfme16.t.mean) <- c("POLE", paste0(str_replace(l1.mean, "_30", ""), "_", names(kfme16.t.mean[-1])))
+    
+    cv <- (kfme16.t %>% dplyr::select(-POLE)) / (kfme16.t.mean %>% dplyr::select(-POLE))
+    
+    names(cv) <- str_replace(names(cv), "stdev", "cv")
+    
+    tbl %<>% bind_cols(cv)
+  }
+}
+
+names(tbl) <- str_replace_all(names(tbl), c("_constant$" = "", "_nd$" = ""))
+sort(names(tbl))
+
+write.csv(tbl, paste0(export_path, export_fileName, ".csv"), row.names = FALSE)
+
+print("celkem:")
+print(Sys.time() - start_time)
